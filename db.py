@@ -1,16 +1,14 @@
 # In db.py
-import os
 
+import streamlit as st
 import mysql.connector
-from dotenv import load_dotenv
 
-# You'll need to configure this with your MySQL details
-load_dotenv()
+
 DB_CONFIG = {
-    'host': 'https://capstoneprojectphase1review2.streamlit.app/',
-    'user': 'root',
-    'password': os.getenv("DB_PASSWORD"),
-    'database': 'Streamlit_DB'
+    'host': st.secrets["DB_HOST"],
+    'user': st.secrets["DB_HOST"],
+    'password': st.secrets["DB_PASSWORD"],
+    'database': st.secrets["DB_DATABASE"]
 }
 
 
