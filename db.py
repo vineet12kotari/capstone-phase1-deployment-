@@ -27,7 +27,8 @@ def get_db_connection():
             'user': st.secrets["DB_USER"],
             'password': st.secrets["DB_PASSWORD"],
             'database': st.secrets["DB_DATABASE"],
-            'port': st.secrets.get("DB_PORT", 3306)
+            'port': int(st.secrets.get("DB_PORT", 3306))
+
         }
 
         # Connect to MySQL
