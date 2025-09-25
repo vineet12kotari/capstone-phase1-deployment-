@@ -1,12 +1,16 @@
 # In db.py
+import os
 
 import mysql.connector
+from dotenv import load_dotenv
 
 # You'll need to configure this with your MySQL details
+load_dotenv()
+db_password = os.getenv("DB_PASSWORD")
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': 'dinkar7898880500',
+    'password': db_password,
     'database': 'Streamlit_DB'
 }
 
