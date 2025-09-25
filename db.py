@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 # You'll need to configure this with your MySQL details
 load_dotenv()
 DB_CONFIG = {
-    'host': 'localhost',
+    'host': 'https://capstoneprojectphase1review2.streamlit.app/',
     'user': 'root',
     'password': os.getenv("DB_PASSWORD"),
     'database': 'Streamlit_DB'
