@@ -5,13 +5,13 @@ import mysql.connector
 from mysql.connector import Error as MySQLError
 import sys
 
-DB_CONFIG = {
-    'host': st.secrets["DB_HOST"],
-    'port': st.secrets.get("DB_PORT", 3306),
-    'user': st.secrets["DB_HOST"],
-    'password': st.secrets["DB_PASSWORD"],
-    'database': st.secrets["DB_DATABASE"]
-}
+# DB_CONFIG = {
+#     'host': st.secrets["DB_HOST"],
+#     'port': st.secrets.get("DB_PORT", 3306),
+#     'user': st.secrets["DB_HOST"],
+#     'password': st.secrets["DB_PASSWORD"],
+#     'database': st.secrets["DB_DATABASE"]
+# }
 
 @st.cache_resource(ttl="30s")  # Set a short TTL to periodically refresh the connection
 def get_db_connection():
