@@ -6,11 +6,10 @@ from dotenv import load_dotenv
 
 # You'll need to configure this with your MySQL details
 load_dotenv()
-db_password = os.getenv("DB_PASSWORD")
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': db_password,
+    'password': os.getenv("DB_PASSWORD"),
     'database': 'Streamlit_DB'
 }
 
