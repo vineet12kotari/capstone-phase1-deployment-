@@ -17,3 +17,5 @@ plotly
 gspread
 mysql-connector-python==8.0.27
 pyotp
+numpy
+snowflake
