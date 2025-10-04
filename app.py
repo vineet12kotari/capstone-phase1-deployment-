@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
 import io
 from datetime import datetime
 from pandasai import SmartDataframe
@@ -17,11 +18,14 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase.ttfonts import TTFont
 import base64
 from dotenv import load_dotenv
-import re
 import json
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
-
+import snowflake.connector
+from sqlalchemy import create_engine
+from snowflake.sqlalchemy import URL
+import urllib.parse
+import re
 # --- New Imports for Authentication, Google Drive and MySQL ---
 import gspread
 from google.oauth2 import service_account
@@ -46,7 +50,6 @@ SESSION_STATE_DIR = "user_sessions"
 if not os.path.exists(SESSION_STATE_DIR):
     os.makedirs(SESSION_STATE_DIR)
 
-# --- Register fonts for ReportLab ---
 # --- Register fonts for ReportLab ---
 pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
 try:
@@ -97,7 +100,7 @@ def get_ai_chart_analysis(df_for_chart, chart_type, x_col, y_col=None, hue_col=N
     try:
         sdf_local = SmartDataframe(df_for_chart, config={"llm": llm_instance})
 
-        # --- NEW, MORE PRECISE PROMPT FOR INSIGHT (Incorporating Heatmap Context) ---
+        # (Incorporating Heatmap Context)
         insight_prompt = (
             f"You are a data analyst. Your task is to provide one factual, data-driven insight. "
             f"Base your analysis STRICTLY on the data summary below. {heatmap_context} "
@@ -108,7 +111,7 @@ def get_ai_chart_analysis(df_for_chart, chart_type, x_col, y_col=None, hue_col=N
         )
         insight = sdf_local.chat(insight_prompt)
 
-        # --- NEW, MORE PRECISE PROMPT FOR CONCLUSION ---
+
         conclusion_prompt = (
             f"Based *only* on the following insight: '{insight}'. "
             f"Provide a brief, strategic conclusion for a business stakeholder. What is the business implication? "
@@ -116,7 +119,7 @@ def get_ai_chart_analysis(df_for_chart, chart_type, x_col, y_col=None, hue_col=N
         )
         conclusion = sdf_local.chat(conclusion_prompt)
 
-        # --- ADDED SAFEGUARD: Check for and handle file path responses ---
+        # SAFEGUARD: Check for and handle file path responses
         if isinstance(conclusion, str) and (
                 '.png' in conclusion or '.jpg' in conclusion or '/' in conclusion or '\\' in conclusion):
             conclusion = "AI returned a chart instead of a textual conclusion. This can happen with ambiguous data. Please try again or use a different chart type for clearer analysis."
@@ -133,9 +136,9 @@ def get_ai_chart_analysis(df_for_chart, chart_type, x_col, y_col=None, hue_col=N
         }
 
 
-# -----------------------------
-# Helper Functions (Keep these as they are, no need to change them)
-# -----------------------------
+
+# Helper Functions
+
 def perform_action(action_func, action_log_text, action_data, fill_value=None):
     st.session_state.df_history[st.session_state.active_df_key].append(st.session_state.df.copy())
     st.session_state.redo_history = []
@@ -784,14 +787,14 @@ def load_session_by_name(session_name, username):
                 io.StringIO(current_df_json), orient="split", convert_dates=True
             )
 
-            # Ensure the active_df_key has the loaded DF (the fully transformed one)
+            # Ensure the active_df_key has the loaded DF
             if st.session_state.active_df_key not in st.session_state.dataframes:
                 st.session_state.dataframes[st.session_state.active_df_key] = st.session_state.df.copy()
             else:
                 # Update the DF in dataframes dict to match the current state loaded from "df" key
                 st.session_state.dataframes[st.session_state.active_df_key] = st.session_state.df.copy()
 
-            # Restore dtypes explicitly (Good logic, keeping it)
+            # Restore dtypes explicitly
             original_dtypes = state_loaded.get("dtypes", {})
             for key, df_to_fix in st.session_state.dataframes.items():
                 for col, dtype in original_dtypes.items():
@@ -845,12 +848,7 @@ def load_session_by_name(session_name, username):
                 for key in st.session_state.dataframes.keys()
             }
 
-            # The *active* history list should contain the loaded transformed state.
-            # When an action is performed, the current df is copied to the history *before* the action.
-            # To simulate the start of a session after transformations, we should clear the
-            # history for the active key so the *next* operation records the loaded state as its 'undo' point.
-            # However, since perform_action *prepends* the current state before applying the change,
-            # clearing the list works well, provided st.session_state.df is the loaded state.
+
             st.session_state.df_history[st.session_state.active_df_key] = []
 
             st.session_state.redo_history = []
@@ -944,9 +942,97 @@ def generate_pdf_report(df, history, kpi_suggestions, chart_data, conclusion):
     return buffer.getvalue()
 
 
-# -----------------------------
+# Locate and modify the load_to_mysql function:
+
+def load_to_mysql(df, host, user, password, database, table_name, if_exists='replace'):
+    try:
+
+        encoded_password = urllib.parse.quote_plus(password)
+
+        # --- STEP 1: Connect to the server WITHOUT specifying the database ---
+        # Note the use of encoded_password in the connection string
+        engine_no_db = create_engine(f'mysql+mysqlconnector://{user}:{encoded_password}@{host}/')
+
+        # --- STEP 2: Create Database if it doesn't exist ---
+        # Note: Need 'from sqlalchemy import text' at the top of app.py
+        from sqlalchemy import text
+        with engine_no_db.connect() as conn:
+            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {database}"))
+            conn.commit()
+
+            # --- STEP 3: Connect to the database and load data ---
+        engine = create_engine(f'mysql+mysqlconnector://{user}:{encoded_password}@{host}/{database}')
+
+        # Load the data
+        df.to_sql(name=table_name, con=engine, if_exists=if_exists, index=False)
+        return True, f"Successfully created database '{database}' (if needed) and loaded {len(df)} rows to MySQL table '{table_name}'."
+    except Exception as e:
+        return False, f"MySQL Load Error: {e}. Ensure the host '{host}' is correct and the user '{user}' has sufficient privileges."
+
+
+# Locate and modify the load_to_snowflake function:
+
+def load_to_snowflake(df, user, password, account, warehouse, database, schema, table_name, if_exists='replace'):
+    # --- FIX: Create a mutable copy and handle problematic dtypes before load ---
+    df_load = df.copy()
+
+    # Identify non-numeric columns that might have been incorrectly treated as numeric during schema inference
+    # (e.g., columns containing car models, which often fail due to Snowflake's strictness).
+    # We force 'object' (string) type for known string columns that might contain mixed types.
+
+    # Based on the error, force 'model' and any column that should be text to be object/string.
+    for col in df_load.columns:
+        # Check if the column is currently a string/object but contains values that might confuse schema inference,
+        # or if it's one of the columns known to cause trouble (like 'model').
+        if col.lower() in ['model', 'body', 'car', 'registration', 'drive']:
+            df_load[col] = df_load[col].astype(str)
+        # Handle cases where nulls cause integer columns to become floats and then fail
+        elif pd.api.types.is_float_dtype(df_load[col]):
+            # Use nullable integer ('Int64') or round to clean up numbers
+            pass  # Allowing floats is usually okay unless precision is an issue
+
+    try:
+        # --- (Existing password encoding remains here) ---
+        import urllib.parse
+        encoded_password = urllib.parse.quote_plus(password)
+
+        # Configure the Snowflake connection URL (use standard 'SNOWFLAKE' database for initial connection)
+        snowflake_url_initial = URL(
+            user=user, password=encoded_password, account=account, warehouse=warehouse,
+            database="SNOWFLAKE",
+            schema="INFORMATION_SCHEMA"
+        )
+
+        engine_initial = create_engine(snowflake_url_initial)
+
+        #  STEP 1: Connect and create Database/Schema if they don't exist
+        from sqlalchemy import text
+        with engine_initial.connect() as conn:
+            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {database}"))
+            conn.execute(text(f"USE DATABASE {database}"))
+            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+            conn.commit()
+
+        #  STEP 2: Connect to the newly created database and load data
+        snowflake_url_final = URL(
+            user=user, password=encoded_password, account=account, warehouse=warehouse,
+            database=database, schema=schema
+        )
+        engine_final = create_engine(snowflake_url_final)
+
+        # Load the modified DataFrame (df_load)
+        with engine_final.connect() as conn_final:
+            # We use 'replace' here, so the schema is correctly re-inferred as VARCHAR
+            df_load.to_sql(table_name, con=conn_final, if_exists=if_exists, index=False)
+
+        return True, f"Successfully created database/schema (if needed) and loaded {len(df_load)} rows to Snowflake table '{table_name}'."
+
+    except Exception as e:
+        return False, f"Snowflake Load Error: {e}. Please check the data types in your DataFrame and target table."
+
+
 # Session State Initialization
-# -----------------------------
+
 if "df" not in st.session_state:
     st.session_state.df = None
 if "original_df" not in st.session_state:
@@ -1019,16 +1105,27 @@ if 'mysql_database' not in st.session_state:
     st.session_state.mysql_database = ''
 if 'gdrive_credentials_ok' not in st.session_state:
     st.session_state.gdrive_credentials_ok = False
+if 'preview_df' not in st.session_state:
+    st.session_state.preview_df = None
+if 'preview_mode' not in st.session_state:
+    st.session_state.preview_mode = False
+if 'final_join_params' not in st.session_state:
+    st.session_state.final_join_params = None
 
 # --- NEW: Session State for Authentication ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "username" not in st.session_state:
     st.session_state.username = None
+# Add this to your main Session State Initialization block:
+if 'last_sql_code' not in st.session_state:
+    st.session_state.last_sql_code = ""
+if 'show_sql_code' not in st.session_state:
+    st.session_state.show_sql_code = False
 
-# -----------------------------
+
 # Authentication and Main UI Control
-# -----------------------------
+
 if not st.session_state.logged_in:
     st.title("Welcome to the Data Analysis App")
     login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
@@ -1089,7 +1186,7 @@ else:
         st.rerun()
 
     # File Upload and Session Management
-    # -----------------------------
+
     st.sidebar.title("Data Upload")
     st.sidebar.markdown("Choose a data source to upload a dataset for analysis.")
     if st.session_state.df is not None:
@@ -1262,6 +1359,112 @@ else:
             else:
                 st.warning("Please select a session to delete.")
 
+    # New DataFrame Management UI
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader(" Manage DataFrames")
+
+    # Creation Section
+    with st.sidebar.expander("Create New DataFrame", expanded=False):
+        if st.session_state.df is not None:
+            df_name = st.text_input("New DataFrame Name:", key="new_df_name")
+            creation_method = st.radio("Creation Method:", ["From Current View", "From Filter", "From Grouped Data"])
+
+            new_df_to_create = None
+
+            # --- FROM FILTER LOGIC ---
+            if creation_method == "From Filter":
+                filter_col = st.selectbox("Filter Column", ["None"] + list(st.session_state.df.columns),
+                                          key="filter_col_df_creation")
+                if filter_col != "None":
+                    filter_operator = st.selectbox("Operator", ["==", "!=", ">", "<", ">=", "<=", "contains"],
+                                                   key="filter_op_df_creation")
+                    filter_value = st.text_input("Value", key="filter_val_df_creation")
+
+                if st.button("Create Filtered DF"):
+                    if df_name and filter_col != "None" and filter_value:
+                        try:
+                            # Logic to apply the filter and create the new df
+                            if filter_operator == "contains":
+                                new_df_to_create = st.session_state.df[
+                                    st.session_state.df[filter_col].astype(str).str.contains(filter_value, case=False,
+                                                                                             na=False)]
+                            else:
+                                # Use query for robust numeric/string filtering
+                                if pd.api.types.is_numeric_dtype(st.session_state.df[filter_col]):
+                                    expression = f"`{filter_col}` {filter_operator} {filter_value}"
+                                else:
+                                    expression = f"`{filter_col}` {filter_operator} '{filter_value}'"
+                                new_df_to_create = st.session_state.df.query(expression)
+                        except Exception as e:
+                            st.error(f"Error applying filter: {e}")
+                    else:
+                        st.warning("Please fill in name, column, and value.")
+
+            # --- FROM GROUPED DATA LOGIC ---
+            elif creation_method == "From Grouped Data":
+                group_cols_df = st.multiselect("Group by Columns", st.session_state.df.columns, key="groupby_cols_df")
+                agg_col_df = st.selectbox("Aggregation Column",
+                                          ["None"] + list(st.session_state.df.select_dtypes(include='number').columns),
+                                          key="agg_col_df")
+                agg_func_df = st.selectbox("Aggregation Function", ["count", "sum", "mean", "median", "min", "max"],
+                                           key="agg_func_df")
+                if st.button("Create Grouped DF"):
+                    if df_name and group_cols_df and agg_col_df != "None" and agg_func_df:
+                        try:
+                            new_df_to_create = st.session_state.df.groupby(group_cols_df)[agg_col_df].agg(
+                                agg_func_df).reset_index()
+                        except Exception as e:
+                            st.error(f"Error creating grouped data: {e}")
+                    else:
+                        st.warning("Please select group by columns, aggregation column, and a function.")
+
+            # --- FROM CURRENT VIEW LOGIC ---
+            else:  # From Current View
+                if st.button("Create Copy of Current View"):
+                    if df_name:
+                        new_df_to_create = st.session_state.df.copy()
+                    else:
+                        st.warning("Please enter a name for the new DataFrame.")
+
+            # --- COMMIT NEW DF TO SESSION STATE ---
+            if new_df_to_create is not None and df_name:
+                if df_name in st.session_state.dataframes:
+                    st.error(f"A DataFrame named '{df_name}' already exists. Choose a different name.")
+                else:
+                    st.session_state.dataframes[df_name] = new_df_to_create
+                    st.session_state.df_history[df_name] = [new_df_to_create.copy()]
+                    st.session_state.history.append(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Created a new DataFrame: '{df_name}'.")
+                    st.success(f"✅ DataFrame '{df_name}' created and set as active!")
+                    st.session_state.df = new_df_to_create.copy()
+                    st.session_state.active_df_key = df_name
+                    st.rerun()
+        else:
+            st.info("Upload data first to create derivative DataFrames.")
+
+    # Switching Section
+    st.sidebar.markdown("#### Active DataFrames")
+
+    if st.session_state.df is not None:
+        current_active_df = st.session_state.active_df_key
+        st.sidebar.success(f"Active: **{current_active_df}** ({len(st.session_state.df)} rows)")
+
+        # Generate switch buttons for all non-active dataframes
+        for key in st.session_state.dataframes:
+            if key != current_active_df:
+                if st.sidebar.button(f"Switch to '{key}'"):
+                    st.session_state.df = st.session_state.dataframes[key].copy()
+                    st.session_state.active_df_key = key
+
+                    # Ensure a history list exists for the newly active DF
+                    if key not in st.session_state.df_history:
+                        st.session_state.df_history[key] = [st.session_state.df.copy()]
+
+                    st.session_state.history.append(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Switched to DataFrame '{key}'.")
+                    st.rerun()
+
     st.sidebar.markdown("---")
     st.sidebar.subheader("Automate Your Workflow")
     st.sidebar.markdown(
@@ -1307,8 +1510,6 @@ else:
         help="Recalculate: Recalculates mean/median/mode from the combined dataset. Apply Previous: Uses the values from the last session for new data.",
         key="incremental_fill_option_radio"
     )
-    # Locate the 'Merge New Files' button logic (around line 1400 in the provided script)
-    # ...
 
     if st.sidebar.button("Merge New Files"):
         if st.session_state.df is None:
@@ -1317,79 +1518,107 @@ else:
             st.warning("Please select at least one new file to merge.")
         else:
             st.info("Merging new files with the existing dataset...")
-            column_level_actions = [
+
+            # --- 1. DEFINE MACRO ACTION CATEGORIES FOR 3-STEP FLOW ---
+            column_level_initial_actions = [
                 'remove_columns', 'split_column', 'change_dtype', 'merge_columns',
-                'create_column', 'sort', 'replace_values', 'aggregate',
-                # 'aggregate' is typically excluded from schema changes
-                'create_column_arithmetic', 'create_column_single_arithmetic',
                 'create_column_date_part', 'create_column_date_add_subtract'
             ]
-            row_level_actions = [
+            row_level_cleaning_actions = [
                 'remove_duplicates', 'fill_nulls', 'remove_rows_by_condition',
                 'remove_outliers'
             ]
-            column_macro = [action for action in st.session_state.macro_actions if
-                            action['action'] in column_level_actions]
-            row_macro = [action for action in st.session_state.macro_actions if action['action'] in row_level_actions]
+            dependent_column_actions = [
+                'create_column_arithmetic',
+                'create_column_single_arithmetic',
+                'create_column',  # Conditional column creation
+            ]
+
+            # Filter saved macro actions into the three lists
+            column_macro_initial = [action for action in st.session_state.macro_actions if
+                                    action['action'] in column_level_initial_actions]
+            row_macro_cleaning = [action for action in st.session_state.macro_actions if
+                                  action['action'] in row_level_cleaning_actions]
+            column_macro_dependent = [action for action in st.session_state.macro_actions if
+                                      action['action'] in dependent_column_actions]
+
+            # Combine cleaning and recalculation for the final macro execution
+            full_row_recalc_macro = row_macro_cleaning + column_macro_dependent
+
+
             new_dfs = []
             new_files_to_process = []
             skipped_files = []
             current_processed_files = st.session_state.get('processed_files', [])
+            target_columns = st.session_state.df.columns.tolist()  # Schema of the existing master DF
 
-            # Define the target column order once
-            target_columns = st.session_state.df.columns.tolist()
-
+            # --- FILE PROCESSING LOOP (STEP 1: Initial Column Alignment) ---
             for f in incremental_files:
                 if f.name not in current_processed_files:
                     try:
                         new_df = load_data(f)
                         if new_df is not None:
-                            # Apply column-level transformations to the new data
-                            temp_col_df, macro_log, success = run_macro(new_df, column_macro)
+                            #  STEP 1: Initial Column Macro (Schema Alignment)
+                            temp_df_step1, macro_log_step1, success_step1 = run_macro(new_df, column_macro_initial)
 
-                            # --- START OF FIX: Relaxing schema check and enforcing column order ---
+                            # Add Dependent columns (as NULLs) to the new DF to align schema before merge.
+                            temp_df_schema = temp_df_step1
+                            for action in column_macro_dependent:
+                                col_name = action['params'].get('new_col') or action['params'].get('new_name')
+                                if col_name and col_name not in temp_df_schema.columns:
+                                    temp_df_schema[col_name] = pd.NA
 
-                            # 1. Check if the set of columns matches (ignoring order)
-                            is_schema_match = success and (set(temp_col_df.columns) == set(target_columns))
+                            # Check final schema consistency with the master
+                            is_schema_consistent = success_step1 and (
+                                        set(temp_df_schema.columns) == set(target_columns))
 
-                            if is_schema_match:
-                                # 2. Enforce the exact target column order before merging
-                                temp_col_df = temp_col_df.reindex(columns=target_columns)
-                                new_dfs.append(temp_col_df)
+                            if is_schema_consistent:
+                                # Enforce the exact target column order before merging (CRUCIAL)
+                                temp_df_schema = temp_df_schema.reindex(columns=target_columns)
+
+                                new_dfs.append(temp_df_schema)
                                 new_files_to_process.append(f.name)
-                                st.session_state.history.extend(macro_log)
+                                st.session_state.history.extend(macro_log_step1)
+
                             else:
-                                st.error(
-                                    f"Schema mismatch for {f.name} after applying column-level transformations. Skipping file. "
-                                    f"New columns: {set(temp_col_df.columns) - set(target_columns) or 'None'}")
+                                st.error(f"Schema mismatch for {f.name} after initial alignment. Skipping file.")
                                 skipped_files.append(f.name)
-                    # --- END OF FIX ---
+
                     except Exception as e:
                         st.error(f"Error loading or transforming incremental file {f.name}: {e}")
                         skipped_files.append(f.name)
 
+            # --- MERGING AND FINAL RECALCULATION (STEPS 2 & 3) ---
             if new_dfs:
+                # 1. Merge the existing master DF with the newly processed DFs
                 combined_df = pd.concat([st.session_state.df] + new_dfs, ignore_index=True)
-                # ... (rest of the block continues unchanged)
                 final_df = combined_df
-                if st.session_state.incremental_fill_option == 'Recalculate on Entire Dataset':
-                    final_df, row_macro_log, success = run_macro(combined_df, row_macro)
+
+                #  STEP 2 & 3: Run Row Cleaning AND Dependent Column Recalculation on the Merged Data
+                st.info("Applying cleaning and dependent calculations to the merged dataset...")
+                final_df, row_macro_log, success = run_macro(combined_df, full_row_recalc_macro)
+
+                if success:
+                    st.session_state.df = final_df
+                    st.success(
+                        f"Successfully merged {len(new_dfs)} new files and applied full transformation workflow.")
                     st.session_state.history.extend(row_macro_log)
-                    if not success:
-                        st.error("Error applying row-level transformations after merge. Check logs.")
-                st.session_state.df = final_df
-                st.success(f"Successfully merged {len(new_dfs)} new files and applied transformations.")
-                st.session_state.history.append(
-                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Merged and processed new files: {', '.join(new_files_to_process)}"
-                )
-                st.session_state.processed_files.extend(new_files_to_process)
-                st.session_state.original_df = st.session_state.df.copy()
-                st.session_state.df_history[st.session_state.active_df_key].append(st.session_state.df.copy())
-                st.rerun()
+                    st.session_state.history.append(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Merged and processed new files: {', '.join(new_files_to_process)}"
+                    )
+                    st.session_state.processed_files.extend(new_files_to_process)
+                    st.session_state.original_df = st.session_state.df.copy()
+                    st.session_state.df_history[st.session_state.active_df_key].append(st.session_state.df.copy())
+                    st.rerun()
+                else:
+                    st.error("Error applying combined row-cleaning and dependent column transformations after merge.")
+                    # You can add a detailed log display here for debugging if needed
+
             else:
                 st.warning("No new files were successfully loaded or merged.")
                 if skipped_files:
                     st.warning(f"Skipped files: {', '.join(skipped_files)}")
+
 
     if st.session_state.df is None and (uploaded_file or uploaded_files):
         if uploaded_file:
@@ -1441,9 +1670,9 @@ else:
         st.info(
             f"Successfully loaded previous session with **{len(st.session_state.df)} rows** and **{len(st.session_state.df.columns)} columns**.")
         st.write("---")
-        st.write("### Restored Data Preview")
+        st.write(" Restored Data Preview")
         st.dataframe(st.session_state.df.head())
-        st.write("### Restored History Log")
+        st.write(" Restored History Log")
         for log in reversed(st.session_state.history):
             st.write(f"- {log}")
         st.session_state.session_restored = False
@@ -1472,21 +1701,21 @@ else:
             "Verify the data type of each column. Changing data types is useful for performing the correct operations, like calculations on numbers or date-based analysis.")
         st.dataframe(df.dtypes.reset_index().rename(columns={'index': 'Column', 0: 'DataType'}))
 
-        # --- ADD THE NULL VALUES CODE SNIPPET HERE ---
+        # THE NULL VALUES CODE SNIPPET
         st.write("### Null Values Per Column")
         st.markdown("This table shows the count of missing (null/NaN) values for each column.")
         null_counts = df.isnull().sum()
         st.dataframe(null_counts[null_counts > 0].to_frame(name="Null Count"))
         if null_counts.sum() == 0:
             st.info("No null values found in the dataset. Data quality is excellent! ")
-        # --- END OF NULL VALUES CODE SNIPPET ---
+        #END OF NULL VALUES CODE SNIPPET
 
-        st.write("### Statistical Summary")
+        st.write("Statistical Summary")
         st.markdown(
             "Get a quick statistical summary of your numerical columns (mean, min, max, etc.) and a count of unique values for all columns.")
         st.write(df.describe(include="all").transpose())
 
-        st.write("### Statistical Summary")
+        st.write("Statistical Summary")
         st.markdown(
             "Get a quick statistical summary of your numerical columns (mean, min, max, etc.) and a count of unique values for all columns.")
         st.write(df.describe(include="all").transpose())
@@ -1499,7 +1728,7 @@ else:
                 st.write(f"*{df[col].nunique()} unique values*")
                 st.write(df[col].unique())
 
-        st.write("### Sort Dataset")
+        st.write("Sort Dataset")
         st.markdown(
             "Rearrange your data based on the values in a specific column, either in ascending or descending order.")
         col_to_sort = st.selectbox("Select column to sort by", ["None"] + list(df.columns))
@@ -1516,224 +1745,279 @@ else:
                 st.warning("Please select a column to sort by.")
 
         st.markdown("---")
-        # -----------------------------
-        # Custom Aggregation (updated)
-        # -----------------------------
+
+        # Custom Aggregation
+
         st.subheader("Custom Aggregation")
         st.markdown(
             "Analyze the frequency of values, optionally grouped by other columns. "
-            "Use *Value Counts* to see frequency distributions, or *Aggregate* to compute numeric aggregations."
-        )
-        st.info(
-            "If you choose Aggregate without group-by, aggregation will be applied across the whole dataset (per column)."
+            "Use Value Counts to see frequency distributions, or Aggregate to compute numeric aggregations."
         )
 
-        target_cols_agg = st.multiselect(
-            "Select target column(s) for aggregation (optional - leave empty to count group combinations)",
-            df.columns, key="agg_target"
+        #  DYNAMIC UPDATE
+        # The code now directly uses the main DataFrame from your session state (st.session_state.df).
+        # This is the currently active DataFrame in your app.
+        df_for_agg = st.session_state.df
+
+
+        agg_type = st.radio(
+            "Choose analysis type:",
+            ["Value Counts", "Aggregate"],
+            key="agg_mode",
+            horizontal=True
         )
-        groupby_cols_agg = st.multiselect(
-            "Select columns to group by (optional)",
-            df.columns, key="agg_groupby"
-        )
-
-        # --- MODIFIED LOGIC START ---
-
-        # Determine if at least one selected target column is numeric
-        is_any_target_numeric = bool(target_cols_agg) and any(
-            pd.api.types.is_numeric_dtype(df[col]) for col in target_cols_agg
-        )
-
-        # If no group-by columns are selected, we can only do aggregate if we have numeric targets
-        # If group-by columns are selected, we can always do Value Counts (count)
-        allow_numeric_aggregate = bool(groupby_cols_agg) and is_any_target_numeric
-
-        # Default to Value Counts, but offer Aggregate if numeric targets and/or group-by columns are selected
-        agg_type = "Value Counts"
-        if is_any_target_numeric or groupby_cols_agg:
-            agg_options = ["Value Counts"]
-            if is_any_target_numeric:
-                agg_options.append("Aggregate")
-
-            agg_type = st.radio("Choose aggregation type:", agg_options, key="agg_mode")
 
         aggregation_mapping = {}
 
-        # If user picked Aggregate, choose function(s)
-        if agg_type == "Aggregate" and is_any_target_numeric:
+        if agg_type == "Aggregate":
+            st.info("In Aggregate mode, you must select numeric columns for calculation.")
+            numeric_cols = df_for_agg.select_dtypes(include=np.number).columns.tolist()
 
-            # Filter for only numeric target columns to apply functions like mean/median/sum
-            numeric_target_cols = [col for col in target_cols_agg if pd.api.types.is_numeric_dtype(df[col])]
-
-            # Allow user to select multiple aggregation functions
-            agg_funcs = st.multiselect(
-                "Select aggregation function(s) to apply to target column(s)",
-                ["mean", "median", "sum", "min", "max", "count", "std", "var"],
-                default=["mean"] if "mean" in ["mean", "median", "sum", "min", "max", "count", "std", "var"] else None,
-                key="agg_func_select"
+            target_cols_agg = st.multiselect(
+                "Select numeric target column(s) for aggregation:",
+                options=numeric_cols,
+                key="agg_target"
+            )
+            groupby_cols_agg = st.multiselect(
+                "Select columns to group by (optional):",
+                options=df_for_agg.columns.tolist(),
+                key="agg_groupby"
             )
 
-            if agg_funcs and numeric_target_cols:
-                # Create mapping where each numeric target column gets all selected functions
-                for col in numeric_target_cols:
-                    aggregation_mapping[col] = agg_funcs
+            if target_cols_agg:
+                agg_funcs = st.multiselect(
+                    "Select aggregation function(s):",
+                    ["mean", "median", "sum", "min", "max", "count", "std", "var"],
+                    default=["mean"],
+                    key="agg_func_select"
+                )
+                if agg_funcs:
+                    for col in target_cols_agg:
+                        aggregation_mapping[col] = agg_funcs
 
-                # If there are non-numeric targets, we can only count them
-                non_numeric_target_cols = [col for col in target_cols_agg if not pd.api.types.is_numeric_dtype(df[col])]
-                for col in non_numeric_target_cols:
-                    if "count" in agg_funcs:
-                        aggregation_mapping[col] = "count"
+        else:  # Value Counts
+            target_cols_agg = st.multiselect(
+                "Select target column(s) to count (optional):",
+                options=df_for_agg.columns.tolist(),
+                key="agg_target_vc"
+            )
+            groupby_cols_agg = st.multiselect(
+                "Select columns to group by (optional):",
+                options=df_for_agg.columns.tolist(),
+                key="agg_groupby_vc"
+            )
 
-        # --- MODIFIED LOGIC END ---
+        # Your Sorting and Button Logic
+        sort_order_agg = st.radio("Sort order:", ["Descending", "Ascending"], key="sort_order_agg", horizontal=True)
 
-        # Sorting UI (This part remains mostly the same, but dynamically updated)
-        sort_order_agg = st.radio("Sort order for the result", ["Descending", "Ascending"], key="sort_order_agg")
-
-        # Prepare sort options depending on result shape
         sort_by_options = []
         if groupby_cols_agg:
             sort_by_options.extend(groupby_cols_agg)
-
         if agg_type == "Value Counts":
             sort_by_options.append("count")
         elif agg_type == "Aggregate" and aggregation_mapping:
-            # Use the first column/function pair for default sorting options
             for col, funcs in aggregation_mapping.items():
-                if isinstance(funcs, list):
-                    sort_by_options.extend([f"{col}_{func}" for func in funcs])
-                else:  # Handle single function case from old logic for robustness, though new is list
-                    sort_by_options.append(f"{col}_{funcs}")
+                sort_by_options.extend([f"{col}_{func}" for func in funcs])
 
-        sort_by_col_agg = st.selectbox("Sort the result by this column:", ["None"] + sort_by_options,
-                                       key="sort_by_col_agg")
+        sort_by_col_agg = st.selectbox("Sort result by:", ["None"] + sort_by_options, key="sort_by_col_agg")
 
-        # ... (The rest of the `if st.button("Apply Analysis"):` logic handles the DataFrame aggregation
-        #      and is robust enough to handle the updated `aggregation_mapping` structure.)
-
-        if st.button("Apply Analysis"):
+        if st.button("Apply Analysis", use_container_width=True, type="primary"):
             if not target_cols_agg and not groupby_cols_agg:
-                st.warning("Please select at least one target column or at least one group-by column.")
+                st.warning("Please select at least one target or group-by column.")
             else:
                 try:
-                    # ----- VALUE COUNTS -----
+                    agg_result = None
                     if agg_type == "Value Counts":
+                        cols_to_group = groupby_cols_agg + target_cols_agg
+                        if not cols_to_group: st.warning("Please select columns to count."); st.stop()
+                        agg_result = df_for_agg.groupby(cols_to_group).size().reset_index(name="count")
+                    else:  # Aggregate
+                        if not aggregation_mapping: st.warning("Please select a target and a function."); st.stop()
                         if groupby_cols_agg:
-                            # If target selected -> counts per (groupby... , target)
-                            if target_cols_agg:
-                                target_col = target_cols_agg[0]  # use first target for value counts
-                                agg_result = (
-                                    df.groupby(groupby_cols_agg + [target_col])
-                                    .size()
-                                    .reset_index(name="count")
-                                )
-                            else:
-                                # no target; counts of each group combination
-                                agg_result = (
-                                    df.groupby(groupby_cols_agg)
-                                    .size()
-                                    .reset_index(name="count")
-                                )
+                            agg_result = df_for_agg.groupby(groupby_cols_agg).agg(aggregation_mapping)
                         else:
-                            # no groupby; simple value_counts on target
-                            target_col = target_cols_agg[0]
-                            agg_result = df[target_col].value_counts().to_frame(name="count").reset_index()
-                            agg_result.columns = [target_col, "count"]
+                            agg_result = df_for_agg[list(aggregation_mapping.keys())].agg(aggregation_mapping)
+                        agg_result = agg_result.reset_index()
 
-                    # ----- AGGREGATE -----
-                    else:  # agg_type == "Aggregate"
-                        if groupby_cols_agg:
-                            # groupby + aggregation mapping
-                            agg_result = df.groupby(groupby_cols_agg).agg(aggregation_mapping).reset_index()
-                        else:
-                            # No group-by: apply aggregation to the entire dataframe for selected columns
-                            # result will be 1-row summary: e.g., col1_mean, col2_mean ...
-                            temp = df[list(aggregation_mapping.keys())].agg(aggregation_mapping)
-                            # temp might be a Series (if single func + multiple cols) or DataFrame (if multi-func). Normalize to DataFrame
-                            if isinstance(temp, pd.Series):
-                                agg_result = temp.to_frame().T
-                            else:
-                                agg_result = pd.DataFrame(temp)
-                                # if columns are MultiIndex, flatten them
-                                if isinstance(agg_result.columns, pd.MultiIndex):
-                                    agg_result.columns = ["_".join(map(str, col)).strip() for col in
-                                                          agg_result.columns.values]
-                                agg_result = agg_result.reset_index(drop=True)
+                    if agg_result is not None:
+                        if isinstance(agg_result.columns, pd.MultiIndex):
+                            agg_result.columns = ["_".join(map(str, col)).strip() for col in
+                                                  agg_result.columns.values]
 
-                    # Ensure DataFrame type
-                    agg_result = pd.DataFrame(agg_result)
+                        if sort_by_col_agg != "None" and sort_by_col_agg in agg_result.columns:
+                            agg_result = agg_result.sort_values(by=sort_by_col_agg,
+                                                                ascending=(sort_order_agg == "Ascending"))
 
-                    # Flatten MultiIndex columns if present
-                    if isinstance(agg_result.columns, pd.MultiIndex):
-                        agg_result.columns = ["_".join([str(c) for c in col]).strip() for col in
-                                              agg_result.columns.values]
+                        st.write("#### Analysis Result:")
+                        st.dataframe(agg_result, use_container_width=True)
 
-                    # Sorting if requested
-                    if sort_by_col_agg != "None" and sort_by_col_agg in agg_result.columns:
-                        agg_result = agg_result.sort_values(by=sort_by_col_agg,
-                                                            ascending=(sort_order_agg == "Ascending"))
-                    else:
-                        # default sort for counts
-                        if "count" in agg_result.columns:
-                            agg_result = agg_result.sort_values(by="count", ascending=(sort_order_agg == "Ascending"))
-
-                    st.write("#### Analysis Result:")
-                    st.dataframe(agg_result)
-
-                    # --- AI conclusion (safe) ---
-                    try:
-                        openai_key = os.getenv("OPENAI_API_KEY", None)
-                        if openai_key:
-                            # only call pandasai if agg_result is a non-empty DataFrame
-                            if isinstance(agg_result, pd.DataFrame) and not agg_result.empty:
-                                sdf_local = SmartDataframe(agg_result, config={"llm": OpenAI(api_token=openai_key)})
-                                agg_conclusion_prompt = (
-                                    "Based on this aggregation table, provide a concise and actionable conclusion for stakeholders. "
-                                    "Mention the key findings and any notable trends or outliers."
-                                )
-                                agg_conclusion = sdf_local.chat(agg_conclusion_prompt)
-                                st.info(f"Conclusion: {agg_conclusion}")
-                            else:
-                                st.info("No valid aggregation result to generate AI conclusion.")
-                        else:
-                            st.info("AI not available (OPENAI_API_KEY not set). Skipping automatic conclusions.")
-                    except Exception as e:
-                        st.warning(f"AI conclusion not available: {e}")
+                        # --- Your AI Conclusion Logic can be placed here if needed ---
 
                 except Exception as e:
-                    st.error(f"Error during analysis: {e}")
-                    st.write("Detailed error:", e)
+                    st.error(f"An error occurred during analysis: {e}")
+
+
         st.markdown("---")
-        # -----------------------------
-        # Joining Datasets (improved)
-        # -----------------------------
+
+        # Joining Datasets
+
         import re
 
 
 
 
 
-        # -------------------------------------------------------------------
-        # START: CORRECTED AI QUESTION SECTION
-        # -------------------------------------------------------------------
-        # ... (rest of the code remains unchanged)
+
+        st.markdown("---")
+        st.write("### 🔗 Joining Datasets")
+        st.markdown(
+            "Upload a second dataset. The process is two-step: **Preview** the joined result, then **Select Final Columns**.")
+
+        # The join file uploader is always present
+        join_file = st.file_uploader("Upload dataset to join with",
+                                     type=["csv", "xlsx", "xls", "parquet", "json", "xml", "orc"],
+                                     key='join_file_uploader')
+
+        if st.session_state.df is not None:
+            # Use a single flag to control the flow state: either viewing the uploader, or viewing the preview.
+            if join_file or st.session_state.preview_mode:
+                try:
+                    # Load the file if it's new, otherwise use the temporary file data (if Streamlit holds it)
+                    df_to_join = load_data(join_file) if join_file else None
+
+                    if df_to_join is not None:
+                        st.write("### 1. Configure Join & Preview")
+
+                        # Check for self-join
+                        is_self_join = st.session_state.df.equals(df_to_join)
+
+                        join_col_1, join_col_2, join_col_3 = st.columns(3)
+
+                        with join_col_1:
+                            join_type = st.selectbox("Join Type", ["inner", "left", "right", "outer"],
+                                                     key="final_join_type")
+
+                        # Dynamic key selection based on self-join status
+                        with join_col_2:
+                            if not is_self_join:
+                                on_col_1 = st.selectbox("Key in Current Data:", st.session_state.df.columns,
+                                                        key="join_key_1")
+                                join_on = {
+                                    on_col_1: st.selectbox("Key in New Data:", df_to_join.columns, key="join_key_2")}
+                            else:
+                                st.info("Self-Join Detected.")
+                                join_on = st.selectbox("Key in Both Datasets:", st.session_state.df.columns,
+                                                       key="join_key_self")
+
+                        with join_col_3:
+                            st.markdown("#####")  # Spacer
+                            if st.button("Preview Join Result"):
+
+                                # Perform the merge based on join type and self-join status
+                                if is_self_join:
+                                    preview_df = st.session_state.df.merge(df_to_join, on=join_on, how=join_type,
+                                                                           suffixes=('', '_new'))
+                                    params_on_cols = join_on
+                                else:
+                                    # FIX APPLIED HERE: Explicitly convert dict_keys/dict_values to lists
+                                    left_keys = list(join_on.keys())
+                                    right_keys = list(join_on.values())
+
+                                    preview_df = st.session_state.df.merge(df_to_join, left_on=left_keys,
+                                                                           right_on=right_keys, how=join_type)
+                                    params_on_cols = f"{left_keys[0]}={right_keys[0]}"  # Simplified for logging
+
+                                st.session_state.preview_df = preview_df
+                                st.session_state.preview_mode = True
+                                st.session_state.final_join_params = {
+                                    "file_name": join_file.name,
+                                    "join_type": join_type,
+                                    "on_cols": params_on_cols  # Store simplified keys
+                                }
+                                st.rerun()
+
+                    # --- Step 2: Column Selection and Finalization ---
+                    if st.session_state.preview_mode and st.session_state.preview_df is not None:
+                        st.write("### 2. Select Final Columns")
+                        st.markdown(
+                            f"**Previewed Result Shape:** {st.session_state.preview_df.shape[0]} rows, {st.session_state.preview_df.shape[1]} columns")
+
+                        selected_columns = st.multiselect(
+                            "Select ALL columns you wish to keep in the final DataFrame:",
+                            options=st.session_state.preview_df.columns.tolist(),
+                            default=st.session_state.preview_df.columns.tolist(),
+                            key="final_cols_select"
+                        )
+
+                        if st.button("Finalize and Use Joined Dataset", type="primary"):
+                            if selected_columns:
+                                final_df_joined = st.session_state.preview_df[selected_columns].copy()
+
+                                # Use the stored parameters for logging
+                                params = st.session_state.final_join_params
+                                log_text = (
+                                    f"Joined dataset with '{params['file_name']}' using a {params['join_type']} join "
+                                    f"on '{params['on_cols']}', resulting in {final_df_joined.shape[1]} columns.")
 
 
-        # -------------------------------------------------------------------
-        # START: CORRECTED AI QUESTION SECTION
-        # -------------------------------------------------------------------
+                                # Function to update the main DF
+                                def update_df_with_join(d):
+                                    # d is the old st.session_state.df, we return the final_df_joined to replace it
+                                    return final_df_joined
+
+
+                                perform_action(
+                                    update_df_with_join,
+                                    log_text,
+                                    {"action": "join", "params": params}
+                                )
+
+                                # Clear preview mode after commit
+                                st.session_state.preview_mode = False
+                                st.session_state.preview_df = None
+                                st.session_state.final_join_params = None
+                                st.rerun()
+
+                            else:
+                                st.warning("Please select at least one column to finalize the join.")
+
+                        st.dataframe(st.session_state.preview_df.head(10), use_container_width=True)
+                        if st.button("Cancel Join and Return to Current Data"):
+                            st.session_state.preview_mode = False
+                            st.session_state.preview_df = None
+                            st.session_state.final_join_params = None
+                            st.rerun()
+
+
+                except Exception as e:
+                    st.error(f"Failed to process join file or configuration: {e}")
+
+        #  AI QUESTION SECTION
+
+
         st.write("### Ask a Question")
         st.markdown(
             "Use this powerful feature to ask any question about your data in natural language. "
             "The AI will generate code and provide a human-readable answer."
         )
+        st.markdown("You can then request the Python or MySQL code used for the answer.")
 
         language_map = {
             "English": "en-US", "Spanish": "es-ES", "French": "fr-FR",
             "German": "de-DE", "Hindi": "hi-IN", "Chinese (Mandarin)": "zh-CN",
             "Japanese": "ja-JP", "Arabic": "ar-SA"
         }
-        selected_language = st.selectbox("Choose Language for Voice Input", list(language_map.keys()), index=0)
-        selected_language_code = language_map[selected_language]
+
+        # --- Language Selection Fix ---
+        default_language = list(language_map.keys())[0]
+
+        selected_language = st.selectbox(
+            "Choose Language for Voice Input",
+            list(language_map.keys()),
+            index=0
+        )
+
+        selected_language_code = language_map.get(selected_language, language_map[default_language])
 
         # --- Input Handling ---
         question = None
@@ -1742,53 +2026,100 @@ else:
         if st.button("Ask AI with Your Voice"):
             question = recognize_speech(selected_language_code)
 
-        # Process text input only if it's new
-        elif query_from_text and query_from_text != st.session_state.last_question:
+        elif query_from_text and query_from_text != st.session_state.get("last_question", ""):
             question = query_from_text
 
         # --- Unified AI Processing ---
-        # If there's a new question, process it
         if question:
             st.session_state.last_question = question
-            st.session_state.show_code = False  # Reset code visibility for new question
+            st.session_state.show_code = False
+            st.session_state.show_sql_code = False
+            st.session_state.last_sql_code = ""
+
             try:
                 with st.spinner("Thinking..."):
                     sdf = SmartDataframe(df, config={"llm": llm})
-                    response = sdf.chat(question)
-                    st.session_state.ai_response = response
+                    response = sdf.chat(str(question))  # ✅ Ensure always a string
+                    st.session_state.ai_response = str(response)
 
-                    # --- THIS IS THE CORRECTED PART ---
-                    # Use the 'last_code_generated' attribute which is available in newer versions
+                    # --- Python Code Capture ---
                     if hasattr(sdf, 'last_code_generated') and sdf.last_code_generated:
                         st.session_state.last_ai_code = sdf.last_code_generated
+
+                        # --- SQL Generation ---
+                        sql_prompt = f"""
+                        Given the data and the following Python analysis code:
+                        ```python
+                        {st.session_state.last_ai_code}
+                        ```
+                        Write the equivalent MySQL query for a table named `data_table`.
+                        Return only the SQL code inside ```sql ... ``` fencing.
+                        Do not include explanations.
+                        """
+
+                        sql_response = str(sdf.chat(sql_prompt))
+
+                        # Try to capture SQL safely
+                        sql_match = re.search(r"```sql\n(.*?)```", sql_response, re.DOTALL | re.IGNORECASE)
+                        if sql_match:
+                            st.session_state.last_sql_code = sql_match.group(1).strip()
+                        else:
+                            sql_match = re.search(r"(SELECT\s.*?;)", sql_response, re.DOTALL | re.IGNORECASE)
+                            if sql_match:
+                                st.session_state.last_sql_code = sql_match.group(1).strip()
+                            elif 'SELECT' in sql_response.upper():
+                                st.session_state.last_sql_code = sql_response.strip()
+                            else:
+                                st.session_state.last_sql_code = ""  # no SQL generated
                     else:
-                        st.session_state.last_ai_code = "# Code not available for this query or no code was generated."
-                    # --- END OF CORRECTION ---
+                        st.session_state.last_ai_code = "# Code not available or skipped by LLM."
+                        st.session_state.last_sql_code = ""
 
             except Exception as e:
                 st.error(f"Error: {e}")
                 st.session_state.ai_response = None
+                st.session_state.last_ai_code = "# Error during processing prevented code generation."
+                st.session_state.last_sql_code = ""
 
         # --- Decoupled Display Logic ---
-        # This section's job is ONLY to display whatever is in the session_state.
-        if st.session_state.ai_response:
+        if st.session_state.get("ai_response"):
             st.write(f"> Your question: *{st.session_state.last_question}*")
             st.write("#### AI Response:")
             st.write(st.session_state.ai_response)
 
-            if st.session_state.last_ai_code:
-                # This button's only job is to flip the 'show_code' boolean state
-                if st.button("Know Code"):
-                    st.session_state.show_code = not st.session_state.show_code
+            code_col, sql_col = st.columns(2)
 
-            # The code is displayed here ONLY if the 'show_code' state is True
-            if st.session_state.show_code:
+            # Python Code Button
+            with code_col:
+                if st.session_state.last_ai_code and not st.session_state.last_ai_code.startswith("#"):
+                    if st.button("Know Python Code", key="btn_know_python"):
+                        st.session_state.show_code = not st.session_state.show_code
+                        st.session_state.show_sql_code = False
+                        st.rerun()
+
+            # MySQL Code Button (only if valid SQL exists)
+            with sql_col:
+                if st.session_state.last_sql_code:
+                    if st.button("Know MySQL Code", key="btn_know_sql"):
+                        st.session_state.show_sql_code = not st.session_state.show_sql_code
+                        st.session_state.show_code = False
+                        st.rerun()
+
+            # Display Python Code
+            if st.session_state.get("show_code", False):
                 st.write("---")
-                st.write("#### Code used to generate response:")
+                st.write("#### Python Code used to generate response:")
                 st.code(st.session_state.last_ai_code, language='python')
-        # -------------------------------------------------------------------
+
+            # Display MySQL Code
+            if st.session_state.get("show_sql_code", False) and st.session_state.last_sql_code:
+                st.write("---")
+                st.write("#### Equivalent MySQL Code:")
+                st.code(st.session_state.last_sql_code, language='sql')
+
+
         # END: CORRECTED AI QUESTION SECTION
-        # -------------------------------------------------------------------
+
         st.markdown("---")
         st.markdown("<h2 style='text-align: center;'>Row Operations</h2>", unsafe_allow_html=True)
         st.markdown(
@@ -2001,10 +2332,10 @@ else:
         else:
             st.info("No numeric columns available for outlier detection.")
 
-        # -----------------------------
+
         # Replace Specific Cell Values
-        # -----------------------------
-        import re  # make sure this import is available at top of file (you can also keep it here)
+
+        import re
 
         st.write("### Replace Specific Cell Values")
         st.markdown(
@@ -2016,7 +2347,7 @@ else:
         if replace_col != "None":
             replace_method = st.radio("Choose replacement method:", ["Manual", "By Condition"], key="replace_method")
 
-            # ---------- Manual Replacement ----------
+            # Manual Replacement
             if replace_method == "Manual":
                 st.info("Enter comma-separated values. Matching is case-insensitive (trimmed).")
                 old_values = st.text_input("Values to replace (comma-separated)", key="manual_old_values")
@@ -2047,7 +2378,7 @@ else:
                     else:
                         st.warning("Please provide old and new values.")
 
-            # ---------- Conditional Replacement ----------
+            #  Conditional Replacement
             else:
                 st.info(
                     "Example: >18 => sets numeric rows where value>18. Combine using & (AND) or | (OR): >=2 & <=4.")
@@ -2091,7 +2422,7 @@ else:
                             op = m.group(1)
                             val_str = m.group(2).strip().strip('\'"')
 
-                            # --- MODIFIED: Try conversion to numeric always for comparison operators ---
+                            #  Try conversion to numeric always for comparison operators
                             # This allows comparison on a column that is currently 'object' but contains numbers
                             # (mixed types or converted after the first replacement)
                             s_converted = pd.to_numeric(series, errors='coerce')
@@ -2380,7 +2711,7 @@ else:
                     else:
                         st.warning("Please provide number of characters and new column names.")
 
-        st.write("### Merge Columns")
+        st.write(" Merge Columns")
         st.markdown("Combine multiple columns into a single new column using a specified delimiter.")
         merge_cols = st.multiselect("Select columns to merge:", df.columns)
         if merge_cols:
@@ -2398,7 +2729,7 @@ else:
                 else:
                     st.warning("Please select at least two columns and provide a new name and delimiter.")
 
-        st.write("### Create New Column from Conditions")
+        st.write(" Create New Column from Conditions")
         st.markdown(
             "Create a new categorical column based on conditions applied to an existing column. This is useful for grouping data into meaningful categories.")
         col_to_categorize = st.selectbox("Select a column to create conditions on", ["None"] + list(df.columns),
@@ -2408,7 +2739,7 @@ else:
             num_conditions = st.number_input("Number of conditions", min_value=1, value=1, step=1, key='num_cond_input')
             conditions = []
             labels = []
-            st.write("#### Define Conditions and Labels")
+            st.write(" Define Conditions and Labels")
             st.info("Example format for conditions:\n"
                     "- <2\n"
                     "- >=2 & <=4\n"
@@ -2447,7 +2778,7 @@ else:
                 else:
                     st.warning("Please fill in all required fields and define at least one condition.")
 
-        st.write("### Create New Column with Arithmetic Operations")
+        st.write(" Create New Column with Arithmetic Operations")
         st.markdown("Create a new column by applying mathematical operations to one or more existing columns.")
         col_names = list(df.columns)
         new_col_name = st.text_input("New column name", key="new_col_name_arithmetic")
@@ -2613,123 +2944,25 @@ else:
                                 st.error(f"Error performing date arithmetic: {e}")
 
         st.markdown("---")
+        st.markdown("---")
         st.markdown("<h2 style='text-align: center;'>Generate Visualization</h2>", unsafe_allow_html=True)
         st.markdown(
             "Create compelling charts and graphs to visualize trends, distributions, and relationships in your data.")
+
+        # Chart Type Selection
         chart_type = st.selectbox(
             "Select Chart Type",
             ["Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart", "Count Plot", "Histogram", "Box Plot", "Heatmap"],
             key="chart_type_select"
         )
 
-        st.markdown("##### Advanced Plotting with Grouped Data")
-        st.info(
-            "Create a temporary aggregated DataFrame and plot it. Useful for charts like 'Average Price by Hotel Type'.")
-        temp_plot_name = st.text_input("Temporary plot name (e.g., 'Hotel_Price_Dist')")
-        temp_groupby = st.multiselect("Group by columns", df.columns, key="temp_groupby")
-        temp_agg_col = st.selectbox("Aggregation column", ["None"] + list(df.select_dtypes(include='number').columns),
-                                    key="temp_agg_col")
-        temp_agg_func = st.selectbox("Aggregation function", ["mean", "sum", "count", "min", "max"],
-                                     key="temp_agg_func")
-
-        sort_advanced_by = st.selectbox("Sort data by", ["None"] + [temp_agg_col], key="sort_advanced_by")
-        sort_advanced_order = st.radio("Sort order", ["Descending", "Ascending"], key="sort_advanced_order")
-        head_n = st.number_input("Show top N rows (0 for all)", min_value=0, step=1, key="head_n")
-
-        st.markdown("---")  # Add a separator before the plot buttons
-
-        if st.button("Generate Advanced Plot"):
-            if temp_plot_name and temp_groupby and temp_agg_col != "None":
-                try:
-                    # Create the aggregated DataFrame that will be used for plotting and AI analysis
-                    temp_df = df.groupby(temp_groupby)[temp_agg_col].agg(temp_agg_func).reset_index()
-
-                    if sort_advanced_by != "None" and sort_advanced_by in temp_df.columns:
-                        temp_df = temp_df.sort_values(by=sort_advanced_by,
-                                                      ascending=(sort_advanced_order == "Ascending"))
-                    if head_n > 0:
-                        temp_df = temp_df.head(head_n)
-
-                    if len(temp_groupby) > 1:
-                        temp_df[temp_plot_name] = temp_df[temp_groupby].astype(str).agg(' - '.join, axis=1)
-                    else:
-                        temp_df[temp_plot_name] = temp_df[temp_groupby[0]]
-
-                    st.subheader(f"Aggregated Data for Plot: {temp_plot_name}")
-                    st.dataframe(temp_df)
-
-                    fig = plt.figure(figsize=(10, 6))
-
-                    if chart_type == "Bar Chart":
-                        ax = sns.barplot(data=temp_df, x=temp_plot_name, y=temp_agg_col)
-                        for container in ax.containers:
-                            ax.bar_label(container)
-                    elif chart_type == "Line Chart":
-                        sns.lineplot(data=temp_df, x=temp_plot_name, y=temp_agg_col)
-                    elif chart_type == "Scatter Plot":
-                        sns.scatterplot(data=temp_df, x=temp_plot_name, y=temp_agg_col)
-                    elif chart_type == "Pie Chart":
-                        plt.pie(temp_df[temp_agg_col], labels=temp_df[temp_plot_name], autopct='%1.1f%%', startangle=90,
-                                pctdistance=0.85)
-                        plt.legend(bbox_to_anchor=(1, 1), loc="upper left")
-                    else:
-                        st.warning(f"Chart type '{chart_type}' is not supported for advanced plotting.")
-                        plt.close(fig)  # Close the figure if not used
-                        st.stop()
-
-                    plt.title(f"{temp_agg_func.capitalize()} of {temp_agg_col} by {', '.join(temp_groupby)}")
-                    plt.xticks(rotation=45, ha='right')
-                    st.pyplot(fig)
-
-                    # --- Generate and Display AI Analysis ---
-                    with st.spinner("Generating AI analysis..."):
-                        ai_analysis = get_ai_chart_analysis(
-                            df_for_chart=temp_df,
-                            chart_type=chart_type,
-                            x_col=temp_plot_name,
-                            y_col=temp_agg_col,
-                            llm_instance=llm
-                        )
-
-                        st.info(f"**Insight:** {ai_analysis['insight']}")
-                        st.success(f"**Conclusion:** {ai_analysis['conclusion']}")
-
-                        # Store the complete chart data for reporting
-                        chart_data_to_store = {
-                            "fig": fig,
-                            "insight": ai_analysis['insight'],
-                            "conclusion": ai_analysis['conclusion']
-                        }
-                        perform_viz_action(
-                            f"Generated '{chart_type}' for {temp_agg_col} by {', '.join(temp_groupby)}",
-                            {"action": "chart", "params": {"type": chart_type, "x": temp_plot_name, "y": temp_agg_col}},
-                            chart_data=chart_data_to_store
-                        )
-
-                    chart_bytes = io.BytesIO()
-                    fig.savefig(chart_bytes, format='png', bbox_inches='tight')
-                    st.download_button(
-                        label="Download Chart",
-                        data=chart_bytes.getvalue(),
-                        file_name=f"{temp_plot_name}.png",
-                        mime="image/png"
-                    )
-                    plt.close(fig)
-
-                except Exception as e:
-                    st.error(f"Error creating advanced plot: {e}")
-            else:
-                st.warning("Please fill in all fields to create an advanced plot.")
-
-        st.markdown("---")
-        # --- Standard Plotting ---
         # --- Standard Plotting ---
         st.markdown("##### Standard Plotting")
         st.info(
-            "You can apply a filter and then group the data before plotting. (e.g., plot 'Survived' for 'Adults' only)"
+            "Configure filters, aggregation, sorting, and top-N limits to prepare your data for plotting."
         )
 
-        # Filtering
+        # Filtering (Kept as is)
         filter_col_viz = st.selectbox("Filter on column (optional)", ["None"] + list(df.columns), key="filter_col_viz")
         filtered_df = df.copy()
 
@@ -2744,31 +2977,33 @@ else:
                 if filtered_df.empty:
                     st.warning("The filter resulted in an empty dataset. Please adjust your filter.")
 
-        # Chart title
+        # Chart title (Kept as is)
         chart_title = st.text_input("Enter chart title:", key="chart_title")
 
-        # Grouping (only available for certain charts in standard mode)
-        grouped_cols_viz = []  # Simplified for clarity
+        # --- NEW AXIS LABEL INPUTS ---
+        x_label = st.text_input("Enter X-axis Label (Optional):", key="x_axis_label_input")
+        y_label = st.text_input("Enter Y-axis Label (Optional):", key="y_axis_label_input")
+        # ------------------------------
 
         x_col, y_col, hue_col, agg_method = None, None, None, None
+        is_agg_applied = False
 
         # Axis and aggregation options
-        if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot", "Box Plot", "Count Plot", "Histogram"]:
+        if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot", "Box Plot", "Count Plot", "Histogram", "Heatmap"]:
 
-            # MODIFICATION: Added "None" to X-axis options
             x_col_options = ["None"] + filtered_df.columns.tolist()
             x_col = st.selectbox("Select X-axis Column", x_col_options, key="chart_x_col")
 
             if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot", "Box Plot"]:
                 y_col = st.selectbox("Select Y-axis Column", ["None"] + list(filtered_df.columns), key="chart_y_col")
 
-                # Show aggregation only if a Y-column is selected and is numeric
                 if y_col != "None" and pd.api.types.is_numeric_dtype(filtered_df[y_col]):
                     agg_method = st.selectbox(
                         "Select aggregation method for the Y-axis",
                         ["mean", "sum", "count", "min", "max", "median"],
                         key="standard_agg_method"
                     )
+                    is_agg_applied = True
                 elif y_col != "None":
                     st.warning(f"Aggregation is not available for non-numeric column '{y_col}'.")
 
@@ -2776,23 +3011,33 @@ else:
                 "Select a column for 'Hue' (optional)", ["None"] + filtered_df.columns.tolist(), key="chart_hue_col"
             )
 
-            # Data validation for single-variable plots
             if chart_type in ["Count Plot", "Histogram", "Box Plot"]:
-                # Ensure at least one axis is selected for single-variable plots
                 if x_col == "None" and y_col == "None":
                     st.warning(f"Please select at least one column (X or Y) for a {chart_type}.")
 
-
         elif chart_type == "Pie Chart":
             x_col = st.selectbox("Select Column for Pie Chart", filtered_df.columns, key="chart_x_col")
+            y_col = 'Count'
         elif chart_type == "Heatmap":
             st.info("Heatmap will show correlations between all numeric columns.")
+
+        # --- Feature 5: Sorting and Top-N (Head) ---
+        sortable_cols = []
+        if x_col != "None":
+            sortable_cols.append(x_col)
+        if y_col != "None" and y_col != 'Count' and y_col != 'Correlation Value':
+            sortable_cols.append(y_col)
+        sortable_cols.append("Count")
+
+        sort_col_viz = st.selectbox("Sort chart bars/points by (value or count):", ["None"] + sortable_cols,
+                                    key="sort_col_viz")
+        sort_order_viz = st.radio("Sort Order:", ["Descending", "Ascending"], key="sort_order_viz")
+        head_n_viz = st.number_input("Show Top N values (0 for all):", min_value=0, step=1, key="head_n_viz")
 
         # --- Generate Plot Button ---
         if st.button("Generate Standard Plot"):
             if filtered_df.empty:
                 st.error("Cannot generate plot on an empty (filtered) dataset.")
-            # Check for minimum required columns based on chart type
             elif chart_type == "Pie Chart" and x_col is None:
                 st.error("Please select a column for the Pie Chart.")
             elif chart_type == "Scatter Plot" and (x_col == 'None' or y_col == 'None'):
@@ -2802,45 +3047,78 @@ else:
             else:
                 fig = plt.figure(figsize=(10, 6))
                 plot_df = filtered_df.copy()
-                final_plot_data_for_ai = plot_df  # Default to the filtered df
+                final_plot_data_for_ai = plot_df
 
-                # Determine the primary plotting column for single-variable charts (Box/Count/Hist)
                 primary_col = x_col if x_col != 'None' else y_col
-
-                # Set a default Y column for AI context if it's a count-based plot
                 y_col_for_ai = y_col
-                if y_col == 'None' and primary_col != 'None' and chart_type in ["Bar Chart", "Count Plot", "Histogram",
-                                                                                "Pie Chart"]:
-                    y_col_for_ai = 'count'
-                elif y_col == 'None' and chart_type == 'Box Plot' and primary_col != 'None':
-                    y_col_for_ai = 'value'
 
                 try:
+                    # --- Aggregation and Counting ---
+                    if chart_type in ["Bar Chart", "Line Chart"] and is_agg_applied:
+                        group_cols = [c for c in [x_col, hue_col] if c != 'None']
+                        final_plot_data_for_ai = plot_df.groupby(group_cols)[y_col].agg(agg_method).reset_index()
+                        y_col_for_ai = y_col
+
+                    elif chart_type in ["Bar Chart", "Count Plot", "Pie Chart"]:
+                        if x_col != 'None':
+                            count_col = x_col
+                        elif y_col != 'None':
+                            count_col = y_col
+                        else:
+                            count_col = None
+
+                        if count_col:
+                            if hue_col != 'None':
+                                final_plot_data_for_ai = plot_df.groupby([count_col, hue_col]).size().reset_index(
+                                    name='count')
+                            else:
+                                final_plot_data_for_ai = plot_df[count_col].value_counts().to_frame().reset_index()
+                                final_plot_data_for_ai.columns = [count_col, 'count']
+
+                            x_col_for_plot = count_col
+                            y_col_for_ai = 'count'
+
+                    # --- Apply Sorting and Head-N ---
+                    sort_by_col = None
+                    if sort_col_viz == 'Count' and 'count' in final_plot_data_for_ai.columns:
+                        sort_by_col = 'count'
+                    elif sort_col_viz != 'None' and sort_col_viz in final_plot_data_for_ai.columns:
+                        sort_by_col = sort_col_viz
+
+                    if sort_by_col:
+                        final_plot_data_for_ai = final_plot_data_for_ai.sort_values(
+                            by=sort_by_col,
+                            ascending=(sort_order_viz == "Ascending")
+                        )
+
+                        if head_n_viz > 0:
+                            final_plot_data_for_ai = final_plot_data_for_ai.head(head_n_viz)
+
+                    # Determine the Order List for Categorical Plots
+                    order_values = None
+                    order_col = x_col if x_col != 'None' else y_col
+
+                    if sort_by_col and order_col != 'None' and order_col in final_plot_data_for_ai.columns:
+                        order_values = final_plot_data_for_ai[order_col].tolist()
+
                     # --- Plotting Logic ---
                     if chart_type == "Bar Chart":
-                        if y_col != 'None' and pd.api.types.is_numeric_dtype(plot_df[y_col]):
-                            final_plot_data_for_ai = plot_df.groupby(x_col)[y_col].agg(agg_method).reset_index()
-                            ax = sns.barplot(data=final_plot_data_for_ai, x=x_col, y=y_col,
-                                             hue=hue_col if hue_col != "None" else None)
-                            plt.ylabel(f"{agg_method.capitalize()} of {y_col}")
-                        else:  # Count plot style
-                            final_plot_data_for_ai = plot_df[x_col].value_counts().to_frame().reset_index()
-                            final_plot_data_for_ai.columns = [x_col, 'count']
-                            y_col_for_ai = 'count'  # Set y_col for AI analysis
-                            ax = sns.barplot(data=final_plot_data_for_ai, x=x_col, y='count',
-                                             hue=hue_col if hue_col != "None" else None)
-                            plt.ylabel("Count")
+                        y_to_plot = y_col_for_ai if y_col_for_ai != y_col else y_col
+
+                        ax = sns.barplot(data=final_plot_data_for_ai, x=x_col, y=y_to_plot,
+                                         hue=hue_col if hue_col != "None" else None,
+                                         order=order_values)
+
+                        plt.ylabel(
+                            f"{agg_method.capitalize()} of {y_col}" if is_agg_applied and not y_label else "Count")
                         for container in ax.containers:
                             ax.bar_label(container)
 
                     elif chart_type == "Line Chart":
-                        if x_col == 'None' or y_col == 'None' or not pd.api.types.is_numeric_dtype(plot_df[y_col]):
-                            st.error("Line charts require both X-axis and a numeric Y-axis column for aggregation.")
+                        if x_col == 'None' or y_col == 'None':
+                            st.error("Line charts require both X-axis and Y-axis columns.")
                             plt.close(fig)
                             st.stop()
-
-                        final_plot_data_for_ai = plot_df.groupby(x_col)[y_col].agg(
-                            agg_method).reset_index().sort_values(by=x_col)
                         sns.lineplot(data=final_plot_data_for_ai, x=x_col, y=y_col,
                                      hue=hue_col if hue_col != "None" else None)
                         plt.ylabel(f"{agg_method.capitalize()} of {y_col}")
@@ -2849,60 +3127,33 @@ else:
                         sns.scatterplot(data=plot_df, x=x_col, y=y_col, hue=hue_col if hue_col != "None" else None)
 
                     elif chart_type == "Box Plot":
-                        # If x_col is None, use y_col as the main variable
-                        if x_col == 'None':
-                            sns.boxplot(data=plot_df, y=y_col if y_col != 'None' else None,
-                                        hue=hue_col if hue_col != "None" else None)
-                            x_col = y_col  # Use y_col as primary for AI analysis
-                            y_col_for_ai = 'value'
-                        # If y_col is None, use x_col as the main variable
-                        elif y_col == 'None':
-                            sns.boxplot(data=plot_df, y=x_col,
-                                        hue=hue_col if hue_col != "None" else None)
-                            x_col = x_col  # x_col is already the primary
-                            y_col_for_ai = 'value'
-                        # If both are set, plot Y against X (grouped distribution)
-                        else:
-                            sns.boxplot(data=plot_df, x=x_col, y=y_col,
-                                        hue=hue_col if hue_col != "None" else None)
-                            y_col_for_ai = y_col
+                        x_for_plot = x_col if x_col != 'None' else None
+                        y_for_plot = y_col if y_col != 'None' else None
+
+                        sns.boxplot(data=plot_df, x=x_for_plot, y=y_for_plot,
+                                    hue=hue_col if hue_col != "None" else None,
+                                    order=order_values if x_for_plot else None)
 
                     elif chart_type == "Pie Chart":
-                        counts = plot_df[x_col].value_counts()
-                        final_plot_data_for_ai = counts.to_frame().reset_index()
-                        final_plot_data_for_ai.columns = [x_col, 'count']
-                        y_col_for_ai = 'count'
-                        plt.pie(counts, labels=counts.index, autopct='%1.1f%%', startangle=90, pctdistance=0.85)
-                        plt.legend(counts.index, bbox_to_anchor=(1.05, 1), loc='upper left')
+                        counts = final_plot_data_for_ai['count']
+                        labels = final_plot_data_for_ai[x_col]
+                        plt.pie(counts, labels=labels, autopct='%1.1f%%', startangle=90, pctdistance=0.85)
+                        plt.legend(labels, bbox_to_anchor=(1.05, 1), loc='upper left')
 
                     elif chart_type == "Count Plot":
-                        if x_col != 'None':
-                            ax = sns.countplot(data=plot_df, x=x_col, hue=hue_col if hue_col != "None" else None,
-                                               order=plot_df[x_col].value_counts().index)
-                            y_col_for_ai = 'count'
-                            for container in ax.containers:
-                                ax.bar_label(container)
-                        elif y_col != 'None':  # Plot count vertically
-                            ax = sns.countplot(data=plot_df, y=y_col, hue=hue_col if hue_col != "None" else None,
-                                               order=plot_df[y_col].value_counts().index)
-                            x_col = y_col  # Use y_col as primary for AI analysis
-                            y_col_for_ai = 'count'
-                        else:
-                            st.error("Count Plot requires at least one column (X or Y).")
-                            plt.close(fig)
-                            st.stop()
+                        x_to_plot = x_col if x_col != 'None' else y_col
+
+                        ax = sns.barplot(data=final_plot_data_for_ai, x=x_to_plot, y='count',
+                                         hue=hue_col if hue_col != "None" else None,
+                                         order=order_values)
+
+                        plt.ylabel("Count")
+                        for container in ax.containers:
+                            ax.bar_label(container)
 
                     elif chart_type == "Histogram":
-                        if x_col != 'None':
-                            sns.histplot(data=plot_df, x=x_col, hue=hue_col if hue_col != "None" else None, kde=True)
-                        elif y_col != 'None':
-                            sns.histplot(data=plot_df, y=y_col, hue=hue_col if hue_col != "None" else None, kde=True)
-                            x_col = y_col  # Use y_col as primary for AI analysis
-                        else:
-                            st.error("Histogram requires at least one column (X or Y).")
-                            plt.close(fig)
-                            st.stop()
-                        y_col_for_ai = 'frequency'  # for AI analysis context
+                        x_to_plot = x_col if x_col != 'None' else y_col
+                        sns.histplot(data=plot_df, x=x_to_plot, hue=hue_col if hue_col != "None" else None, kde=True)
 
                     elif chart_type == "Heatmap":
                         numeric_df = plot_df.select_dtypes(include=['number'])
@@ -2911,116 +3162,181 @@ else:
                             plt.close(fig)
                             st.stop()
                         sns.heatmap(numeric_df.corr(), annot=True, cmap='coolwarm', fmt=".2f")
-                        final_plot_data_for_ai = numeric_df.corr()  # Use correlation matrix for AI
+                        final_plot_data_for_ai = numeric_df.corr()
                         x_col = 'Correlation Matrix'
                         y_col_for_ai = 'Correlation Value'
 
-                    # --- Final Touches and Display ---
+                    #  AI/Download Logic
                     plt.title(chart_title if chart_title else f"{chart_type} of {primary_col}")
                     plt.xticks(rotation=45, ha='right')
+
+                    #APPLY AXIS LABELS
+                    if x_label:
+                        plt.xlabel(x_label)
+                    if y_label:
+                        plt.ylabel(y_label)
+
+
                     plt.tight_layout()
                     st.pyplot(fig)
 
-                    # --- Generate and Display AI Analysis ---
-                    with st.spinner("Generating AI analysis..."):
-                        ai_analysis = get_ai_chart_analysis(
-                            df_for_chart=final_plot_data_for_ai,
-                            chart_type=chart_type,
-                            x_col=x_col,
-                            y_col=y_col_for_ai,
-                            hue_col=hue_col,
-                            llm_instance=llm
-                        )
-
-                        st.info(f"**Insight:** {ai_analysis['insight']}")
-                        st.success(f"**Conclusion:** {ai_analysis['conclusion']}")
-
-                        # Store the complete chart data for reporting
-                        chart_data_to_store = {
-                            "fig": fig,
-                            "insight": ai_analysis['insight'],
-                            "conclusion": ai_analysis['conclusion']
-                        }
-                        perform_viz_action(
-                            f"Generated standard '{chart_type}' for {x_col}",
-                            {"action": "chart", "params": {"type": chart_type, "x": x_col, "y": y_col}},
-                            chart_data=chart_data_to_store
-                        )
-
-                    # --- Download Button ---
-                    chart_bytes = io.BytesIO()
-                    fig.savefig(chart_bytes, format='png', bbox_inches='tight')
-                    st.download_button(
-                        label="Download Chart",
-                        data=chart_bytes.getvalue(),
-                        file_name=f"{chart_title or chart_type}.png",
-                        mime="image/png"
-                    )
-                    plt.close(fig)
+                    # Store the figure for potential AI generation/reporting
+                    st.session_state.current_chart_figure = fig
+                    st.session_state.current_chart_data = {
+                        "df_for_chart": final_plot_data_for_ai,
+                        "chart_type": chart_type,
+                        "x_col": x_col,
+                        "y_col": y_col_for_ai,
+                        "hue_col": hue_col
+                    }
+                    # Reset AI analysis state
+                    st.session_state.show_ai_analysis = False
+                    st.session_state.ai_analysis_result = None
 
                 except Exception as e:
                     st.error(f"An error occurred while generating the plot: {e}")
                     plt.close(fig)
+
+        # --- Feature 1: Conditional AI Insight Generation ---
+
+        if st.session_state.get('current_chart_figure') is not None:
+            if st.button("Give Insights and Conclusion (Uses API Credits)"):
+                st.session_state.show_ai_analysis = True
+
+                with st.spinner("Generating AI analysis..."):
+                    params = st.session_state.current_chart_data
+                    ai_analysis = get_ai_chart_analysis(
+                        df_for_chart=params['df_for_chart'],
+                        chart_type=params['chart_type'],
+                        x_col=params['x_col'],
+                        y_col=params['y_col'],
+                        hue_col=params['hue_col'],
+                        llm_instance=llm
+                    )
+                    st.session_state.ai_analysis_result = ai_analysis
+
+                chart_data_to_store = {
+                    "fig": st.session_state.current_chart_figure,
+                    "insight": ai_analysis['insight'],
+                    "conclusion": ai_analysis['conclusion'],
+                    "generated_ai": True
+                }
+
+                st.session_state.chart_data.append(chart_data_to_store)
+
+                perform_viz_action(
+                    f"Generated standard '{params['chart_type']}' for {params['x_col']} with AI Analysis.",
+                    {"action": "chart",
+                     "params": {"type": params['chart_type'], "x": params['x_col'], "y": params['y_col']}}
+                )
+                st.rerun()
+
+        if st.session_state.get('ai_analysis_result') is not None and st.session_state.show_ai_analysis:
+            ai_analysis = st.session_state.ai_analysis_result
+            st.info(f"**Insight:** {ai_analysis['insight']}")
+            st.success(f"**Conclusion:** {ai_analysis['conclusion']}")
+
+            if st.session_state.get('current_chart_figure') is not None:
+                chart_bytes = io.BytesIO()
+                st.session_state.current_chart_figure.savefig(chart_bytes, format='png', bbox_inches='tight')
+                st.download_button(
+                    label="Download Chart",
+                    data=chart_bytes.getvalue(),
+                    file_name=f"{chart_title or chart_type}.png",
+                    mime="image/png"
+                )
+                plt.close(st.session_state.current_chart_figure)
+
+            st.session_state.current_chart_figure = None
+            st.session_state.ai_analysis_result = None
+            st.session_state.current_chart_data = None
+            st.session_state.show_ai_analysis = False
+
+        st.markdown("---")
         st.markdown("---")
         st.markdown("<h2 style='text-align: center;'>Summary, KPI and Report Generation</h2>", unsafe_allow_html=True)
         st.markdown("Get a final summary of your data, including key insights and a professional PDF report.")
-        st.info(
-            "Note: Please click 'View Final Summary & KPIs' before attempting to download the report to ensure all sections are populated.")
 
-        if st.button("View Final Summary & KPIs"):
-            # --- ADD THIS LINE ---
-            # Create the SmartDataframe instance here to make it available for this section.
-            sdf = SmartDataframe(df, config={"llm": llm})
-            # ---------------------
+        # NEW CONTROL CHECKBOX
+        generate_ai_summary = st.checkbox(
+            "Include AI-Powered KPI & Conclusion in Report (Uses API Credits)",
+            value=True,
+            key="include_ai_summary_checkbox"
+        )
 
+        #  Display Area for Statistical Review
+        if st.button("View Statistical Summary & Nulls"):
+            # This button remains separate and does NOT call the API
             st.write("### Updated Statistical Summary")
             st.write(df.describe(include="all").transpose())
             st.write("### Null Values After Cleaning")
             st.write(df.isnull().sum())
-            st.write("### AI-Powered KPI Suggestions")
 
-            with st.spinner("Generating KPI suggestions..."):
-                try:
-                    kpi_suggestions = sdf.chat(
-                        f"Generate a detailed, paragraph-based conclusion for stakeholders based on the dataset. Include key trends (e.g., year-by-year changes), top-performing categories, revenue/rating distributions, and any notable correlations. The report should be easy for a business user to understand, and it must include specific numbers, percentages, and data points to support the claims.")
-                    st.session_state.kpi_suggestions = kpi_suggestions
-                    st.write(f"Suggested KPIs: {kpi_suggestions}")
-                except Exception as e:
-                    st.error(f"Error generating KPI suggestions: {e}")
-
-            st.subheader("AI-Powered Conclusion")
-            st.info("The AI-generated conclusion will focus on actionable insights for stakeholders.")
-
-            with st.spinner("Generating final conclusion..."):
-                try:
-                    conclusion_prompt = f"Based on the following KPI suggestions: {st.session_state.kpi_suggestions}. Please provide a brief, actionable conclusion for stakeholders. For example, if the KPI suggests 'Region 2 has the highest sales,' the conclusion should be 'Stakeholders should focus on marketing efforts in Region 2 to maximize sales.'"
-                    conclusion = sdf.chat(conclusion_prompt)
-                    st.session_state.conclusion_text = conclusion
-                    st.write(f"**Conclusion:** {conclusion}")
-                except Exception as e:
-                    st.error(f"Error generating AI conclusion: {e}")
 
         if st.button("Download Full Analysis Report"):
+
+            kpi_suggestions = "KPI and Conclusion generation was skipped by user selection."
+            conclusion = "Report generated without AI insights (user selection)."
+
+            # --- CONDITIONAL AI GENERATION ---
+            if generate_ai_summary:
+                try:
+                    with st.spinner("Generating AI Summary and Report..."):
+                        sdf = SmartDataframe(df, config={"llm": llm})
+
+                        # API Call 1: KPI Suggestions
+                        kpi_prompt = (
+                            f"Generate a detailed list of **Key Performance Indicators (KPIs)** based ONLY on the dataset. The response MUST be formatted as a numbered list of actionable points. Include specific data points, percentages, top categories, and strategic implications to support the claims."
+                        )
+                        kpi_suggestions = sdf.chat(kpi_prompt)
+
+                        # API Call 2: Conclusion
+                        conclusion_prompt = (
+                            f"Based on the following KPI suggestions: {kpi_suggestions}. Please provide a brief, actionable conclusion for stakeholders. "
+                            f"The conclusion should focus on 1-2 strategic recommendations."
+                        )
+                        conclusion = sdf.chat(conclusion_prompt)
+
+                    st.success("AI analysis complete! Report ready for download.")
+
+                except Exception as e:
+                    st.error(f"Error generating AI content: {e}. Report generated without AI sections.")
+                    kpi_suggestions = f"AI Generation Failed: {e}"
+                    conclusion = "AI Conclusion Failed."
+
+            # ---------------------------------
+
+            # 4. Store results temporarily (Using the final values, whether generated or skipped)
+            st.session_state.kpi_suggestions = kpi_suggestions
+            st.session_state.conclusion_text = conclusion
+
             try:
-                if 'kpi_suggestions' not in st.session_state or 'conclusion_text' not in st.session_state or not st.session_state.kpi_suggestions:
-                    st.error(
-                        "Please generate KPI suggestions and the conclusion first by clicking 'View Final Summary & KPIs'.")
-                else:
-                    kpi_suggestions = st.session_state.kpi_suggestions
-                    conclusion = st.session_state.conclusion_text
-                    report_content = generate_pdf_report(
-                        df, st.session_state.history, kpi_suggestions,
-                        st.session_state.chart_data, conclusion
-                    )
-                    st.download_button(
-                        label="Download PDF Report",
-                        data=report_content,
-                        file_name="Data_Analysis_Report.pdf",
-                        mime="application/pdf",
-                        key="download_report"
-                    )
+                # 5. Generate and trigger download
+                report_content = generate_pdf_report(
+                    df,
+                    st.session_state.history,
+                    kpi_suggestions,
+                    st.session_state.chart_data,
+                    conclusion
+                )
+
+                st.download_button(
+                    label="Download PDF Report",
+                    data=report_content,
+                    file_name="Data_Analysis_Report.pdf",
+                    mime="application/pdf",
+                    key="download_report"
+                )
+
+                # Optionally display the final outcome
+                if generate_ai_summary:
+                    st.subheader("Generated AI Insights (for Review)")
+                    st.markdown(f"**KPI Suggestions:**")
+                    st.markdown(kpi_suggestions)
+                    st.markdown(f"**Conclusion:** {conclusion}")
+
             except Exception as e:
-                st.error(f"Error generating PDF report: {e}")
+                st.error(f"Error during report finalization: {e}")
 
         st.markdown("---")
         st.markdown("<h2 style='text-align: center;'>Downloading Cleaned Data</h2>", unsafe_allow_html=True)
@@ -3033,6 +3349,76 @@ else:
             "text/csv",
             key='download-csv'
         )
+
+        st.markdown("---")
+        st.markdown("<h2 style='text-align: center;'>Load (L) Final Data</h2>", unsafe_allow_html=True)
+        st.markdown("Load your cleaned and transformed dataset directly into a production database.")
+
+        load_target = st.radio("Choose Target Database:", ["MySQL/RDS", "Snowflake"], key="load_target")
+        table_name = st.text_input("Target Table Name (e.g., cleaned_data)", key="target_table_name")
+        load_mode = st.radio("Load Mode:", ["Replace Existing Table", "Append to Existing Table"], key="load_mode")
+        if_exists = 'replace' if load_mode == "Replace Existing Table" else 'append'
+
+        if load_target == "MySQL/RDS":
+            st.subheader("MySQL/RDS Credentials")
+            # Using session state variables defined in the Upload section for persistence
+            mysql_host_load = st.text_input("Host", value=st.session_state.mysql_host, key="mysql_host_load")
+            mysql_user_load = st.text_input("User", value=st.session_state.mysql_user, key="mysql_user_load")
+            mysql_password_load = st.text_input("Password", type="password", value=st.session_state.mysql_password,
+                                                key="mysql_password_load")
+            mysql_database_load = st.text_input("Database Name", value=st.session_state.mysql_database,
+                                                key="mysql_database_load")
+
+            if st.button("Load to MySQL/RDS"):
+                if table_name and mysql_host_load and mysql_user_load and mysql_database_load:
+                    with st.spinner("Loading data to MySQL..."):
+                        success, message = load_to_mysql(
+                            df=df,
+                            host=mysql_host_load,
+                            user=mysql_user_load,
+                            password=mysql_password_load,
+                            database=mysql_database_load,
+                            table_name=table_name,
+                            if_exists=if_exists
+                        )
+                        if success:
+                            st.success(message)
+                            st.session_state.history.append(
+                                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded data to MySQL table: {table_name}")
+                        else:
+                            st.error(message)
+
+        elif load_target == "Snowflake":
+            st.subheader("Snowflake Credentials")
+            sf_user = st.text_input("User", key="sf_user")
+            sf_password = st.text_input("Password", type="password", key="sf_password")
+            sf_account = st.text_input("Account Identifier (e.g., xyz12345)", key="sf_account")
+            sf_warehouse = st.text_input("Warehouse (e.g., COMPUTE_WH)", key="sf_warehouse")
+            sf_database = st.text_input("Database", key="sf_database")
+            sf_schema = st.text_input("Schema", key="sf_schema")
+
+            if st.button("Load to Snowflake"):
+                if table_name and sf_user and sf_password and sf_account and sf_warehouse and sf_database and sf_schema:
+                    with st.spinner("Loading data to Snowflake..."):
+                        success, message = load_to_snowflake(
+                            df=df,
+                            user=sf_user,
+                            password=sf_password,
+                            account=sf_account,
+                            warehouse=sf_warehouse,
+                            database=sf_database,
+                            schema=sf_schema,
+                            table_name=table_name,
+                            if_exists=if_exists
+                        )
+                        if success:
+                            st.success(message)
+                            st.session_state.history.append(
+                                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded data to Snowflake table: {table_name}")
+                        else:
+                            st.error(message)
+
+
         st.markdown("---")
         st.markdown("<h3 style='text-align: center;'>History Log</h3>", unsafe_allow_html=True)
         st.markdown("Review the history of all the transformations and operations you have performed on your data.")
